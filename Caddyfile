@@ -1,0 +1,3 @@
+{$DOMAIN} {
+	reverse_proxy gosecret:8080
+}

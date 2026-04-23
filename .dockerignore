@@ -1,0 +1,6 @@
+data/
+.env
+.git
+*.md
+Caddyfile
+docker-compose.yml

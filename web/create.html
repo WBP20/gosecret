@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gosecret</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="logo">gosecret</div>
+  <div class="sub">e2ee · one-shot · written in go</div>
+
+  <div class="tag">single-use // destroyed on first read</div>
+
+  <div id="created" class="hidden">
+    <div class="msg msg-ok">copy now — link shown once</div>
+    <div class="url-box" id="createdUrl"></div>
+    <div class="actions">
+      <button id="copyBtn" type="button">copy</button>
+      <button id="newBtn" type="button" class="btn-ghost">new</button>
+    </div>
+    <div class="meta" id="createdMeta"></div>
+  </div>
+
+  <form id="form">
+    <div id="err" class="msg msg-err hidden"></div>
+
+    <div class="field">
+      <span class="prompt">payload</span>
+      <textarea id="secret" required placeholder="paste secret here..." autocomplete="off" spellcheck="false"></textarea>
+    </div>
+
+    <button type="button" id="optToggle" class="toggle">challenge (optional)</button>
+    <div id="optBody" class="optional-body hidden">
+      <div class="field">
+        <span class="prompt">question</span>
+        <input id="question" type="text" maxlength="500" placeholder="order # / manager name / ..." autocomplete="off">
+      </div>
+      <div class="field">
+        <span class="prompt">answer</span>
+        <input id="answer" type="text" placeholder="case/accent insensitive" autocomplete="off">
+      </div>
+      <div class="field">
+        <span class="prompt">tries</span>
+        <div class="chips">
+          <input type="radio" name="attempts" id="at-3" value="3"><label for="at-3">3</label>
+          <input type="radio" name="attempts" id="at-5" value="5" checked><label for="at-5">5</label>
+          <input type="radio" name="attempts" id="at-10" value="10"><label for="at-10">10</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="row-inline">
+      <div>
+        <span class="prompt">ttl</span>
+        <div class="chips" id="ttlChips">
+          <input type="radio" name="ttl" id="ttl-5m" value="300"><label for="ttl-5m">5m</label>
+          <input type="radio" name="ttl" id="ttl-1h" value="3600"><label for="ttl-1h">1h</label>
+          <input type="radio" name="ttl" id="ttl-24h" value="86400" checked><label for="ttl-24h">24h</label>
+          <input type="radio" name="ttl" id="ttl-3d" value="259200"><label for="ttl-3d">3d</label>
+          <input type="radio" name="ttl" id="ttl-7d" value="604800"><label for="ttl-7d">7d</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-md">
+      <button id="submit" type="submit">encrypt →</button>
+    </div>
+  </form>
+
+  <footer>
+    <span class="k">cipher</span> aes-256-gcm &nbsp; <span class="k">key</span> url#fragment &nbsp; <span class="k">server</span> blind
+  </footer>
+</div>
+
+<script type="module" src="/static/create.js"></script>
+</body>
+</html>

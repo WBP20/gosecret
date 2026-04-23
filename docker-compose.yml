@@ -1,0 +1,30 @@
+services:
+  gosecret:
+    build: .
+    command: ["-addr", ":8080", "-data", "/app/data", "-base-url", "https://${DOMAIN}", "-trust-proxy"]
+    restart: unless-stopped
+    volumes:
+      - gosecret-data:/app/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - DOMAIN=${DOMAIN}
+    depends_on:
+      - gosecret
+
+volumes:
+  gosecret-data:
+  caddy-data:
+  caddy-config:

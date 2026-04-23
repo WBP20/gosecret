@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gosecret</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="logo">gosecret</div>
+  <div class="sub">incoming transmission</div>
+
+  <div class="tag">single-use // destroyed on read</div>
+
+  <div id="loading" class="msg msg-info loading">loading</div>
+
+  <div id="err" class="msg msg-err hidden"></div>
+
+  <div id="questionCard" class="hidden">
+    <div class="challenge" id="questionText"></div>
+    <form id="unlockForm">
+      <div class="field">
+        <span class="prompt">answer</span>
+        <input id="answer" type="text" required autofocus autocomplete="off">
+      </div>
+      <div class="meta" id="attemptsMeta"></div>
+      <div class="mt-sm">
+        <button type="submit" id="unlockBtn">unlock →</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="consumeCard" class="hidden">
+    <div class="msg msg-warn">revealing this will destroy the secret</div>
+    <button id="consumeBtn" type="button" class="btn-danger">reveal →</button>
+  </div>
+
+  <div id="revealCard" class="hidden">
+    <div class="msg msg-ok">decrypted locally · server wiped</div>
+    <div class="secret-reveal" id="revealed"></div>
+    <div class="mt-sm">
+      <button id="copySecret" type="button">copy</button>
+    </div>
+  </div>
+
+  <footer>
+    <span class="k">key</span> never sent to server &nbsp; <span class="k">decrypt</span> browser-side
+  </footer>
+</div>
+
+<script type="module" src="/static/view.js"></script>
+</body>
+</html>
