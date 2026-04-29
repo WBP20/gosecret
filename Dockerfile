@@ -16,4 +16,4 @@ COPY --from=build /gosecret /app/gosecret
 VOLUME /app/data
 EXPOSE 8080
 ENTRYPOINT ["/app/gosecret"]
-CMD ["-addr", ":8080", "-data", "/app/data", "-trust-proxy"]
+CMD ["-addr", ":8080", "-data", "/app/data"]

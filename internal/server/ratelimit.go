@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"net"
 	"sync"
 	"time"
@@ -11,16 +12,24 @@ type ipLimiter struct {
 	rate    float64
 	burst   float64
 	maxKeys int
-	window  map[string]*bucket
+	window  map[string]*list.Element // value: *bucket (Element.Value)
+	lru     *list.List               // front = most recent, back = oldest
 }
 
 type bucket struct {
+	key    string
 	tokens float64
 	last   time.Time
 }
 
 func newIPLimiter(rate, burst float64) *ipLimiter {
-	return &ipLimiter{rate: rate, burst: burst, maxKeys: 50000, window: make(map[string]*bucket)}
+	return &ipLimiter{
+		rate:    rate,
+		burst:   burst,
+		maxKeys: 50000,
+		window:  make(map[string]*list.Element),
+		lru:     list.New(),
+	}
 }
 
 func (l *ipLimiter) Allow(key string) bool {
@@ -28,21 +37,29 @@ func (l *ipLimiter) Allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	b, ok := l.window[key]
-	if !ok {
-		if len(l.window) >= l.maxKeys {
-			l.evictOldest()
+	if el, ok := l.window[key]; ok {
+		b := el.Value.(*bucket)
+		elapsed := now.Sub(b.last).Seconds()
+		if elapsed < 0 {
+			elapsed = 0 // clock skew (e.g. NTP correction)
 		}
-		l.window[key] = &bucket{tokens: l.burst - 1, last: now}
+		b.tokens = min(l.burst, b.tokens+elapsed*l.rate)
+		b.last = now
+		l.lru.MoveToFront(el)
+		if b.tokens < 1 {
+			return false
+		}
+		b.tokens--
 		return true
 	}
-	elapsed := now.Sub(b.last).Seconds()
-	b.tokens = min(l.burst, b.tokens+elapsed*l.rate)
-	b.last = now
-	if b.tokens < 1 {
-		return false
+	if len(l.window) >= l.maxKeys {
+		if back := l.lru.Back(); back != nil {
+			delete(l.window, back.Value.(*bucket).key)
+			l.lru.Remove(back)
+		}
 	}
-	b.tokens--
+	b := &bucket{key: key, tokens: l.burst - 1, last: now}
+	l.window[key] = l.lru.PushFront(b)
 	return true
 }
 
@@ -60,29 +77,21 @@ func normalizeIP(ip string) string {
 	return parsed.Mask(mask).String()
 }
 
-func (l *ipLimiter) evictOldest() {
-	var oldestKey string
-	var oldestTime time.Time
-	first := true
-	for k, b := range l.window {
-		if first || b.last.Before(oldestTime) {
-			oldestKey = k
-			oldestTime = b.last
-			first = false
-		}
-	}
-	if !first {
-		delete(l.window, oldestKey)
-	}
-}
-
 func (l *ipLimiter) sweep(maxAge time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
-	for k, b := range l.window {
-		if b.last.Before(cutoff) {
-			delete(l.window, k)
+	// LRU back-to-front: as soon as we see a fresh bucket, the rest is fresher.
+	for {
+		back := l.lru.Back()
+		if back == nil {
+			return
 		}
+		b := back.Value.(*bucket)
+		if !b.last.Before(cutoff) {
+			return
+		}
+		delete(l.window, b.key)
+		l.lru.Remove(back)
 	}
 }

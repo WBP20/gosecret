@@ -242,6 +242,105 @@ gosecret/
 go test ./...
 ```
 
+## Limites de taille du payload
+
+Le champ `payload` (le secret a transmettre) est cape cote serveur. Voici ce
+qui passe et ce qui ne passe pas :
+
+| Donnee                                | Taille typique | Verdict |
+|---------------------------------------|----------------|---------|
+| Mot de passe / passphrase             | < 100 octets   | OK      |
+| Token API / JWT                       | 0.5 - 2 KB     | OK      |
+| Cle SSH Ed25519 privee                | ~400 octets    | OK      |
+| Cle SSH RSA-2048 privee               | ~1.7 KB        | OK      |
+| Cle SSH RSA-4096 privee               | ~3.2 KB        | OK      |
+| Cle SSH RSA-8192 privee (paranoide)   | ~6.5 KB        | OK      |
+| Dossier `~/.ssh/` complet (concatene) | ~30 KB         | OK      |
+| Certificat TLS + cle privee           | 5 - 10 KB      | OK      |
+| Bloc de configuration `kubeconfig`    | 5 - 20 KB      | OK      |
+| Plaintext arbitraire                  | jusqu'a ~64 KB | OK      |
+| Photo / binaire / wallet              | > 64 KB        | refuse  |
+
+**Plafond effectif : ~64 KB de plaintext.** Au-dela, le serveur retourne
+`bad_ciphertext`. Pour transmettre des fichiers volumineux, le pattern
+recommande reste : un canal pour le fichier (storage chiffre, S3, etc.) et
+gosecret pour le mot de passe / la cle de dechiffrement.
+
+### Bornes serveur
+
+| Limite                  | Valeur          | Source                           |
+|-------------------------|-----------------|----------------------------------|
+| Body HTTP create        | 128 KB          | `MaxBytesReader` sur `/api/secrets` |
+| Ciphertext (post-base64)| 64 KB           | `Config.MaxCiphertextBytes`     |
+| Question                | 512 octets      | `Config.MaxQuestionBytes`       |
+| Reponse challenge       | 1024 octets     | `Config.MaxAnswerBytes`         |
+| Secrets actifs total    | 10 000          | `Config.MaxActiveSecrets`       |
+| En-tetes HTTP           | 16 KB           | `http.Server.MaxHeaderBytes`    |
+
+Avec `MaxActiveSecrets * MaxCiphertextBytes = 640 MB` au pire cas pour les
+ciphertexts en BDD. Le hard-cap renvoie `503 capacity` une fois atteint, donc
+pas de saturation disque silencieuse.
+
+## Pistes d'amelioration
+
+### Argon2id sur la reponse challenge
+
+**Aujourd'hui** : la reponse au challenge est verifiee via
+`HMAC-SHA256(server_secret, id || normalize(answer))`. HMAC est rapide
+(~100 ns), donc si **DB et `server.key` fuitent simultanement**, un attaquant
+peut tester ~1 milliard de reponses par seconde sur GPU. Pour des reponses
+faibles ("Jean Dupont", "ORD-12345"), c'est cassable en quelques secondes.
+
+**Avec Argon2id** :
+`AnswerHash = Argon2id(salt=id, key=server_secret, password=normalize(answer), t=3, m=64MB, p=1)`
+
+| Aspect              | HMAC (actuel) | Argon2id        |
+|---------------------|---------------|-----------------|
+| Latence par essai   | < 1 ms        | 100 - 300 ms    |
+| RAM par essai       | ~0            | 64 MB           |
+| Brute-force GPU     | 1e9 essais/s  | 10 - 100 essais/s |
+| Gain securite       | -             | ~10^7x          |
+
+**A considerer si** : le modele de menace inclut le dump simultane de
+`/app/data` (DB + `server.key`).
+
+**A ne pas faire si** : la menace principale reste la boite mail compromise
+— HMAC + rate-limit (5 tentatives par secret + 0.2 rps par IP) suffit deja.
+
+**Risque a prevoir** : amplification DoS RAM. Mitiger via worker-pool borne
+(max N calculs Argon2 paralleles) ou parametres modestes (16 MB / 50 ms).
+
+### Rotation de `server.key`
+
+**Probleme** : `server.key` est unique pour tous les `AnswerHash`. La perdre
+invalide tous les challenges actifs ; la voir compromise impose de tout
+regenerer.
+
+**Approche** : versioning des cles + champ `KeyVersion` sur `Secret` +
+re-HMAC paresseux au unlock. Schema :
+
+1. `/data/server.key.1`, `server.key.2`, ... avec un pointeur `current`.
+2. `Secret` stocke `KeyVersion` au moment de la creation.
+3. Au unlock, le serveur charge la cle correspondant a `KeyVersion`. Si la
+   reponse est valide ET la version est ancienne, il re-HMAC avec la version
+   courante et persiste.
+4. Flag CLI `gosecret -rotate-key` genere `server.key.N+1` et bascule
+   `current`.
+5. Une cle ancienne peut etre supprimee une fois que tous les secrets qui
+   la referencent ont expire (au plus `MaxTTL = 7j`).
+
+Effort : ~150 lignes Go. Bonus : ouvre la voie a une migration progressive
+HMAC -> Argon2id en mappant `KeyVersion -> algo`.
+
+### Autres pistes
+
+- **Pieces jointes chiffrees** (changement de paradigme : 2 canaux distincts).
+- **Webhook de notification de lecture** pour le createur.
+- **Revocation manuelle** d'un secret par son createur (token de revoke).
+- **Backend pluggable** (Postgres / Redis) pour scale-out multi-instance.
+- **Metriques Prometheus** (`secrets_created_total`, `unlock_failed_total`).
+- **Cles HSM-backed** pour `server.key` (PKCS#11, KMS).
+
 ## Limitations connues
 
 - BoltDB est single-writer : convient pour un serveur unique, pas pour du

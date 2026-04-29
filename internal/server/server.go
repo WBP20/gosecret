@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -43,17 +44,15 @@ type Server struct {
 	cfg          Config
 	store        *store.Store
 	serverSecret []byte
-	web          fs.FS
 	createLim    *ipLimiter
 	unlockLim    *ipLimiter
 }
 
-func New(cfg Config, st *store.Store, serverSecret []byte, web fs.FS) *Server {
+func New(cfg Config, st *store.Store, serverSecret []byte, _ fs.FS) *Server {
 	return &Server{
 		cfg:          cfg,
 		store:        st,
 		serverSecret: serverSecret,
-		web:          web,
 		createLim:    newIPLimiter(1, 10),
 		unlockLim:    newIPLimiter(0.2, 5),
 	}
@@ -125,12 +124,14 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 }
 
 func requireJSON(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	return strings.HasPrefix(ct, "application/json")
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/json"
 }
 
+// isValidID enforces the exact shape produced by RandomID: 22 base64url chars
+// (16 raw bytes, no padding).
 func isValidID(id string) bool {
-	if len(id) < 16 || len(id) > 32 {
+	if len(id) != 22 {
 		return false
 	}
 	for _, c := range id {
@@ -175,12 +176,17 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ct, err := base64.StdEncoding.DecodeString(req.Ciphertext)
-	if err != nil || len(ct) == 0 || len(ct) > s.cfg.MaxCiphertextBytes {
+	// AES-GCM ciphertext is plaintext || 16-byte auth tag, so anything shorter
+	// than 16 bytes cannot be a valid GCM output.
+	if err != nil || len(ct) < 16 || len(ct) > s.cfg.MaxCiphertextBytes {
 		writeErr(w, http.StatusBadRequest, "bad_ciphertext", "invalid or too large ciphertext")
 		return
 	}
 	iv, err := base64.StdEncoding.DecodeString(req.IV)
-	if err != nil || len(iv) == 0 || len(iv) > 32 {
+	// AES-GCM standard IV is 12 bytes. Other lengths trigger a different GHASH
+	// derivation and are not what our frontend produces — reject them so a
+	// malicious creator cannot push a degenerate IV.
+	if err != nil || len(iv) != 12 {
 		writeErr(w, http.StatusBadRequest, "bad_iv", "invalid iv")
 		return
 	}
@@ -192,7 +198,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_answer", "answer too long")
 		return
 	}
-	if (req.Question == "") != (req.Answer == "") {
+	question := strings.TrimSpace(req.Question)
+	normalizedAnswer := NormalizeAnswer(req.Answer)
+	if (question == "") != (normalizedAnswer == "") {
 		writeErr(w, http.StatusBadRequest, "bad_qa", "question and answer must both be set or both empty")
 		return
 	}
@@ -222,12 +230,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		ID:          id,
 		Ciphertext:  ct,
 		IV:          iv,
-		Question:    strings.TrimSpace(req.Question),
+		Question:    question,
 		MaxAttempts: maxAttempts,
 		ExpiresAt:   time.Now().Add(ttl),
 		CreatedAt:   time.Now(),
 	}
-	if req.Answer != "" {
+	if normalizedAnswer != "" {
 		sec.AnswerHash = AnswerHash(s.serverSecret, id, req.Answer)
 	}
 	if err := s.store.PutIfUnder(sec, s.cfg.MaxActiveSecrets); err != nil {
@@ -249,9 +257,6 @@ type metaResp struct {
 	HasQuestion bool      `json:"has_question"`
 	Question    string    `json:"question,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at"`
-	Consumed    bool      `json:"consumed"`
-	Expired     bool      `json:"expired"`
-	Locked      bool      `json:"locked"`
 	Remaining   int       `json:"remaining_attempts"`
 }
 
@@ -280,9 +285,6 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		HasQuestion: sec.AnswerHash != nil,
 		Question:    sec.Question,
 		ExpiresAt:   sec.ExpiresAt,
-		Consumed:    false,
-		Expired:     false,
-		Locked:      false,
 		Remaining:   max0(sec.MaxAttempts - sec.Attempts),
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -319,7 +321,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_json", "invalid JSON body")
 		return
 	}
-	if len(req.Answer) > 1024 {
+	if len(req.Answer) > s.cfg.MaxAnswerBytes {
 		writeErr(w, http.StatusBadRequest, "bad_answer", "answer too long")
 		return
 	}
@@ -333,7 +335,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 			return store.ErrConsumed
 		}
 		if sec.AnswerHash == nil {
-			return errors.New("no_question")
+			return errNoQuestion
 		}
 		if sec.MaxAttempts > 0 && sec.Attempts >= sec.MaxAttempts {
 			return store.ErrLocked
@@ -375,6 +377,8 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 				"message":            "incorrect answer",
 				"remaining_attempts": remaining,
 			})
+		case errors.Is(err, errNoQuestion):
+			writeErr(w, http.StatusConflict, "no_question", "this secret has no challenge; use /consume")
 		default:
 			writeErr(w, http.StatusBadRequest, "invalid", "invalid request")
 		}
@@ -386,7 +390,11 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var errBadAnswer = errors.New("bad_answer")
+var (
+	errBadAnswer        = errors.New("bad_answer")
+	errNoQuestion       = errors.New("no_question")
+	errQuestionRequired = errors.New("question_required")
+)
 
 func (s *Server) handleConsume(w http.ResponseWriter, r *http.Request) {
 	if !s.unlockLim.Allow(clientIP(r, s.cfg.TrustProxy)) {
@@ -412,7 +420,7 @@ func (s *Server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			return store.ErrConsumed
 		}
 		if sec.AnswerHash != nil {
-			return errors.New("question_required")
+			return errQuestionRequired
 		}
 		now := time.Now()
 		sec.ConsumedAt = &now
@@ -429,6 +437,8 @@ func (s *Server) handleConsume(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusGone, "expired", "secret expired")
 		case errors.Is(err, store.ErrConsumed):
 			writeErr(w, http.StatusGone, "consumed", "secret already consumed")
+		case errors.Is(err, errQuestionRequired):
+			writeErr(w, http.StatusConflict, "question_required", "this secret has a challenge; use /unlock")
 		default:
 			writeErr(w, http.StatusBadRequest, "invalid", "invalid request")
 		}
@@ -487,8 +497,9 @@ func securityHeaders(h http.Handler) http.Handler {
 		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
 		// Strict CSP: only inline styles allowed (we keep all JS in external files).
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self'; "+
-				"font-src 'self'; img-src 'self' data:; connect-src 'self'; "+
+			"default-src 'self'; script-src 'self'; script-src-attr 'none'; "+
+				"style-src 'self'; object-src 'none'; font-src 'self'; "+
+				"img-src 'self' data:; connect-src 'self'; "+
 				"base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		h.ServeHTTP(w, r)
 	})

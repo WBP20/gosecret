@@ -81,7 +81,10 @@ body::before {
   align-items: center;
   gap: 12px;
   line-height: 1;
+  text-decoration: none;
+  width: fit-content;
 }
+.logo:hover { color: var(--cyan); }
 .logo::before {
   content: "▮";
   animation: blink 1.2s steps(2) infinite;

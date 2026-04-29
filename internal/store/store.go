@@ -1,38 +1,41 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
 
 var (
-	ErrNotFound  = errors.New("secret not found")
-	ErrConsumed  = errors.New("secret already consumed")
-	ErrExpired   = errors.New("secret expired")
-	ErrLocked    = errors.New("too many failed attempts")
+	ErrNotFound = errors.New("secret not found")
+	ErrConsumed = errors.New("secret already consumed")
+	ErrExpired  = errors.New("secret expired")
+	ErrLocked   = errors.New("too many failed attempts")
 )
 
 var bucket = []byte("secrets")
 
 type Secret struct {
-	ID           string     `json:"id"`
-	Ciphertext   []byte     `json:"ct"`
-	IV           []byte     `json:"iv"`
-	Question     string     `json:"q,omitempty"`
-	AnswerHash   []byte     `json:"ah,omitempty"`
-	MaxAttempts  int        `json:"ma"`
-	Attempts     int        `json:"at"`
-	ExpiresAt    time.Time  `json:"exp"`
-	ConsumedAt   *time.Time `json:"cat,omitempty"`
-	UnlockedAt   *time.Time `json:"uat,omitempty"`
-	CreatedAt    time.Time  `json:"ct_at"`
+	ID          string     `json:"id"`
+	Ciphertext  []byte     `json:"ct"`
+	IV          []byte     `json:"iv"`
+	Question    string     `json:"q,omitempty"`
+	AnswerHash  []byte     `json:"ah,omitempty"`
+	MaxAttempts int        `json:"ma"`
+	Attempts    int        `json:"at"`
+	ExpiresAt   time.Time  `json:"exp"`
+	ConsumedAt  *time.Time `json:"cat,omitempty"`
+	UnlockedAt  *time.Time `json:"uat,omitempty"`
+	CreatedAt   time.Time  `json:"ct_at"`
 }
 
 type Store struct {
-	db *bolt.DB
+	db    *bolt.DB
+	count atomic.Int64
 }
 
 func Open(path string) (*Store, error) {
@@ -40,26 +43,27 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	s := &Store{db: db}
 	err = db.Update(func(tx *bolt.Tx) error {
-		_, e := tx.CreateBucketIfNotExists(bucket)
-		return e
+		b, e := tx.CreateBucketIfNotExists(bucket)
+		if e != nil {
+			return e
+		}
+		// Seed the in-memory counter from the actual key count once at open.
+		// Subsequent writes update it via tx.OnCommit hooks, so we never have
+		// to walk the bucket again on the request path.
+		s.count.Store(int64(b.Stats().KeyN))
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) Count() (int, error) {
-	var n int
-	err := s.db.View(func(tx *bolt.Tx) error {
-		n = tx.Bucket(bucket).Stats().KeyN
-		return nil
-	})
-	return n, err
-}
+func (s *Store) Count() int64 { return s.count.Load() }
 
 var ErrCapacity = errors.New("at capacity")
 
@@ -70,14 +74,21 @@ func (s *Store) Put(sec *Secret) error {
 func (s *Store) PutIfUnder(sec *Secret, maxKeys int) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucket)
-		if maxKeys > 0 && b.Stats().KeyN >= maxKeys {
+		if maxKeys > 0 && s.count.Load() >= int64(maxKeys) {
 			return ErrCapacity
 		}
+		existed := b.Get([]byte(sec.ID)) != nil
 		data, err := json.Marshal(sec)
 		if err != nil {
 			return err
 		}
-		return b.Put([]byte(sec.ID), data)
+		if err := b.Put([]byte(sec.ID), data); err != nil {
+			return err
+		}
+		if !existed {
+			tx.OnCommit(func() { s.count.Add(1) })
+		}
+		return nil
 	})
 }
 
@@ -99,14 +110,24 @@ func (s *Store) Get(id string) (*Secret, error) {
 
 func (s *Store) Delete(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucket).Delete([]byte(id))
+		b := tx.Bucket(bucket)
+		if b.Get([]byte(id)) == nil {
+			return nil
+		}
+		if err := b.Delete([]byte(id)); err != nil {
+			return err
+		}
+		tx.OnCommit(func() { s.count.Add(-1) })
+		return nil
 	})
 }
 
-// Update runs fn inside a write transaction. fn may mutate the secret; the
-// mutated value is ALWAYS persisted regardless of fn's return value.
-// This is critical for security: failed unlock attempts must persist the
-// incremented counter even when fn returns an error.
+// Update runs fn inside a write transaction. The mutated value is persisted
+// whenever fn observably changed it, regardless of fn's return value. This is
+// critical for security: failed unlock attempts must persist the incremented
+// counter even when fn returns an error. When fn returns an error and made no
+// observable change to the marshaled form, the write is skipped to avoid
+// useless write amplification.
 func (s *Store) Update(id string, fn func(*Secret) error) (*Secret, error) {
 	var out Secret
 	var fnErr error
@@ -116,6 +137,7 @@ func (s *Store) Update(id string, fn func(*Secret) error) (*Secret, error) {
 		if v == nil {
 			return ErrNotFound
 		}
+		original := append([]byte(nil), v...)
 		if err := json.Unmarshal(v, &out); err != nil {
 			return err
 		}
@@ -123,6 +145,9 @@ func (s *Store) Update(id string, fn func(*Secret) error) (*Secret, error) {
 		data, err := json.Marshal(&out)
 		if err != nil {
 			return err
+		}
+		if fnErr != nil && bytes.Equal(original, data) {
+			return nil
 		}
 		return b.Put([]byte(id), data)
 	})
@@ -159,6 +184,10 @@ func (s *Store) PurgeExpired(grace time.Duration) (int, error) {
 				return err
 			}
 			removed++
+		}
+		if removed > 0 {
+			r := int64(removed)
+			tx.OnCommit(func() { s.count.Add(-r) })
 		}
 		return nil
 	})

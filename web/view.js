@@ -51,7 +51,6 @@ async function decryptAndReveal(rawKey, ciphertextB64, ivB64) {
       btn.style.color = "var(--red)";
     }
   };
-  history.replaceState(null, "", window.location.pathname);
 }
 
 async function main() {
@@ -59,6 +58,9 @@ async function main() {
   const rawKey = keyFromFragment();
   if (!rawKey) { showError("missing key in url#fragment"); return; }
   if (rawKey.length !== 32) { showError("invalid key length — link may be truncated"); return; }
+  // Strip the key from the URL/history immediately; rawKey holds the bytes for
+  // the rest of the flow. Prevents leakage via browser history, sync, screenshots.
+  history.replaceState(null, "", window.location.pathname);
 
   let meta;
   try {
@@ -67,10 +69,6 @@ async function main() {
     if (!res.ok) { showError("server error"); return; }
     meta = await res.json();
   } catch { showError("network error"); return; }
-
-  if (meta.consumed) { showError("already read & destroyed"); return; }
-  if (meta.expired)  { showError("expired"); return; }
-  if (meta.locked)   { showError("locked — too many failed attempts"); return; }
 
   loading.classList.add("hidden");
 
